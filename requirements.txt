@@ -1,0 +1,8 @@
+python-dotenv
+pydantic
+langchain-core
+langchain-openai
+langgraph
+datasets
+tqdm
+huggingface_hub

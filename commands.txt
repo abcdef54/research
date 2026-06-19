@@ -1,0 +1,21 @@
+mkdir -p /workspace/models
+mkdir -p /workspace/.cache/huggingface
+
+export HF_HOME=/workspace/.cache/huggingface
+export HF_HUB_CACHE=/workspace/.cache/huggingface
+
+
+
+python download_model.py --model qwen3b
+
+
+
+
+docker run --rm --gpus all \
+  -p 18888:8080 \
+  -v /workspace/models:/models \
+  ghcr.io/ggml-org/llama.cpp:server-cuda \
+  -m /models/qwen2.5-3b-instruct-q4_k_m.gguf \
+  -ngl 99 \
+  -c 2048 \
+  --parallel 16
