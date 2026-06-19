@@ -92,7 +92,7 @@ def get_llm(
     """
     cfg = config["configurable"]
     model_name = cfg.get("model_name", "qwen")
-    base_url = os.getenv("LOCAL_LLM_URL", "http://localhost:18888/v1")
+    base_url = os.getenv("LOCAL_LLM_URL", "http://localhost:18000/v1")
     temp = temperature if temperature is not None else cfg.get("temperature", 0.0)
 
     llm = _build_llm(model_name, base_url, temp)
