@@ -8,7 +8,8 @@ from tqdm import tqdm
 import time 
 import math
 
-from graph import GRAPH, AgentState
+# from graph import GRAPH, AgentState
+from ranker import GRAPH_RANKER, AgentState
 
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
@@ -88,6 +89,8 @@ async def solve(
     model_name: str,
     reasoning_mode: str,
     temperature: float,
+    rank_mode: str,
+    rank_temperature: float
 ):
     config = {
         "configurable": {
@@ -97,6 +100,8 @@ async def solve(
             "reasoning_mode": reasoning_mode,
             "bypass_governor": True,
             "temperature": temperature,
+            "rank_mode": rank_mode,
+            "rank_temperature": rank_temperature
         }
     }
 
@@ -131,7 +136,7 @@ async def solve(
         "unique_answers": 0,
     }
 
-    result = await GRAPH.ainvoke(
+    result = await GRAPH_RANKER.ainvoke(
         init,
         config=config,
     )
@@ -146,6 +151,9 @@ async def evaluate_sample(
     model_name,
     reasoning_mode,
     temperature,
+    rank_mode,
+    rank_temperature,
+    save_raw
 ):
     q = sample["question"]
     gt = extract_gsm8k_label(
@@ -162,6 +170,8 @@ async def evaluate_sample(
                 model_name,
                 reasoning_mode,
                 temperature,
+                rank_mode,
+                rank_temperature
             )
 
         latency = (
@@ -191,6 +201,36 @@ async def evaluate_sample(
         vote_distribution = state.get(
             "vote_distribution",
             {},
+        )
+
+        rank_reasoning = state.get(
+            "rank_reasoning",
+            None,
+        )
+
+        rank_latency = state.get(
+            "rank_latency",
+            0.0,
+        )
+
+        rank_calls = state.get(
+            "rank_calls",
+            0,
+        )
+
+        rank_parse_failed = state.get(
+            "rank_parse_failed",
+            False,
+        )
+
+        rank_agreed_with_majority = state.get(
+            "rank_agreed_with_majority",
+            True,
+        )
+
+        winner_candidate_id = state.get(
+            "winner_candidate_id",
+            None,
         )
 
         unique_answers = state.get(
@@ -289,7 +329,9 @@ async def evaluate_sample(
             # Experiment configuration
             "model": model_name,
             "mode": reasoning_mode,
+            "rank_mode": rank_mode,
             "temperature": temperature,
+            "rank_temperature": rank_temperature,
             "width": width,
 
             # Diversity metrics
@@ -300,6 +342,14 @@ async def evaluate_sample(
             "is_unanimous": is_unanimous,
             "invalid_samples": invalid_samples,
 
+            #Ranking Metrics
+            "rank_latency": rank_latency,
+            "rank_calls": rank_calls,
+            "rank_parse_failed": rank_parse_failed,
+            "rank_agreed_with_majority": rank_agreed_with_majority,
+            "winner_candidate_id": winner_candidate_id,
+            "rank_reasoning": rank_reasoning,
+
             # Performance
             "latency_sec": latency,
 
@@ -308,7 +358,7 @@ async def evaluate_sample(
             "vote_distribution": vote_distribution,
 
             # Optional (large CSV)
-            "sampled_answers": sampled_answers,
+            "sampled_answers": sampled_answers if save_raw else None,
 
             # Final answer text
             "response": pred_text,
@@ -332,6 +382,13 @@ async def evaluate_sample(
             "is_unanimous": False,
             "vote_margin": 0,
 
+            "rank_latency": 0.0,
+            "rank_calls": 0,
+            "rank_parse_failed": False,
+            "rank_agreed_with_majority": False,
+            "winner_candidate_id": None,
+            "rank_reasoning": None,
+
             "latency_sec": 0.0,
 
             "sampled_numbers": [],
@@ -347,7 +404,10 @@ async def evaluate(
     model_name,
     reasoning_mode,
     temperature,
+    rank_mode,
+    rank_temperature,
     csv_path,
+    save_raw
 ):
     tasks = [
         evaluate_sample(
@@ -356,6 +416,9 @@ async def evaluate(
             model_name,
             reasoning_mode,
             temperature,
+            rank_mode,
+            rank_temperature,
+            save_raw
         )
         for i, sample
         in enumerate(dataset)
@@ -376,6 +439,12 @@ async def evaluate(
     majority_failed_count = 0
     total_vote_margin = 0.0
     total_unanimous = 0
+
+    rank_parse_failures = 0
+    rank_disagreements = 0
+
+    total_rank_latency = 0.0
+    total_rank_calls = 0
 
     with open(
         csv_path,
@@ -400,6 +469,17 @@ async def evaluate(
                 "model",
                 "mode",
                 "temperature",
+                "rank_mode",
+                "rank_temperature",
+
+                "rank_latency",
+                "rank_calls",
+
+                "rank_parse_failed",
+                "rank_agreed_with_majority",
+
+                "winner_candidate_id",
+                "rank_reasoning",
                 "width",
 
                 "unique_answers",
@@ -471,6 +551,24 @@ async def evaluate(
 
             total_invalid += result[
                 "invalid_samples"
+            ]
+
+            rank_parse_failures += int(
+                result["rank_parse_failed"]
+            )
+
+            rank_disagreements += int(
+                not result[
+                    "rank_agreed_with_majority"
+                ]
+            )
+
+            total_rank_latency += result[
+                "rank_latency"
+            ]
+
+            total_rank_calls += result[
+                "rank_calls"
             ]
 
             accuracy = (
@@ -553,6 +651,34 @@ async def evaluate(
         else 0.0
     )
 
+    avg_rank_latency = (
+        total_rank_latency
+        / completed
+        if completed > 0
+        else 0.0
+    )
+
+    avg_rank_calls = (
+        total_rank_calls
+        / completed
+        if completed > 0
+        else 0.0
+    )
+
+    rank_disagreement_ratio = (
+        rank_disagreements
+        / completed
+        if completed > 0
+        else 0.0
+    )
+
+    rank_parse_failure_ratio = (
+        rank_parse_failures
+        / completed
+        if completed > 0
+        else 0.0
+    )
+
     print("\n================ RESULTS ================\n")
 
     print(
@@ -610,6 +736,31 @@ async def evaluate(
         f"{avg_latency:.4f}s"
     )
 
+    print(
+        f"Average Rank Calls: "
+        f"{avg_rank_calls:.4f}"
+    )
+
+    print(
+        f"Average Rank Latency: "
+        f"{avg_rank_latency:.4f}s"
+    )
+
+    print(
+        f"Rank Parse Failures: "
+        f"{rank_parse_failures}"
+    )
+
+    print(
+        f"Rank Parse Failure Ratio: "
+        f"{rank_parse_failure_ratio:.4f}"
+    )
+
+    print(
+        f"Rank Disagreement Ratio: "
+        f"{rank_disagreement_ratio:.4f}"
+    )
+
     print("\n=========================================\n")
 
     return results
@@ -629,6 +780,8 @@ if __name__ == "__main__":
             "low",
             "medium",
             "high",
+            "extra",
+            "max"
         ],
         default="low",
     )
@@ -637,6 +790,27 @@ if __name__ == "__main__":
         "--temp",
         type=float,
         default=0.0,
+    )
+
+    parser.add_argument(
+        "--rank-mode",
+        choices=[
+            "majority",
+            "rank_no_reasoning",
+            "rank_with_reasoning",
+        ],
+        default="majority",
+    )
+
+    parser.add_argument(
+        "--rank-temp",
+        type=float,
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--save-raw",
+        action="store_true",
     )
 
     parser.add_argument(
@@ -692,5 +866,8 @@ if __name__ == "__main__":
             reasoning_mode=args.mode,
             temperature=args.temp,
             csv_path=csv_path,
+            rank_mode=args.rank_mode,
+            rank_temperature=args.rank_temp,
+            save_raw=args.save_raw
         )
     )

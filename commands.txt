@@ -19,3 +19,6 @@ docker run --rm --gpus all \
   -ngl 99 \
   -c 2048 \
   --parallel 16
+
+
+  llama-server -m /workspace/models/qwen2.5-3b-instruct-q4_k_m.gguf --port 18000 -ngl 99 -c 65536 --parallel 64
