@@ -233,6 +233,21 @@ async def evaluate_sample(
             None,
         )
 
+        tournament_rounds = state.get(
+            "tournament_rounds",
+            0,
+        )
+
+        tournament_rank_calls = state.get(
+            "tournament_rank_calls",
+            0,
+        )
+
+        tournament_max_group_size = state.get(
+            "tournament_max_group_size",
+            0,
+        )
+
         unique_answers = state.get(
             "unique_answers",
             0,
@@ -350,6 +365,11 @@ async def evaluate_sample(
             "winner_candidate_id": winner_candidate_id,
             "rank_reasoning": rank_reasoning,
 
+            # Tournament Metrics (Experiment 3A; 0 for non-tournament modes)
+            "tournament_rounds": tournament_rounds,
+            "tournament_rank_calls": tournament_rank_calls,
+            "tournament_max_group_size": tournament_max_group_size,
+
             # Performance
             "latency_sec": latency,
 
@@ -388,6 +408,10 @@ async def evaluate_sample(
             "rank_agreed_with_majority": False,
             "winner_candidate_id": None,
             "rank_reasoning": None,
+
+            "tournament_rounds": 0,
+            "tournament_rank_calls": 0,
+            "tournament_max_group_size": 0,
 
             "latency_sec": 0.0,
 
@@ -446,6 +470,10 @@ async def evaluate(
     total_rank_latency = 0.0
     total_rank_calls = 0
 
+    total_tournament_rounds = 0
+    total_tournament_calls = 0
+    max_tournament_group = 0
+
     with open(
         csv_path,
         "w",
@@ -481,6 +509,10 @@ async def evaluate(
                 "winner_candidate_id",
                 "rank_reasoning",
                 "width",
+
+                "tournament_rounds",
+                "tournament_rank_calls",
+                "tournament_max_group_size",
 
                 "unique_answers",
                 "agreement_ratio",
@@ -571,6 +603,19 @@ async def evaluate(
                 "rank_calls"
             ]
 
+            total_tournament_rounds += result[
+                "tournament_rounds"
+            ]
+
+            total_tournament_calls += result[
+                "tournament_rank_calls"
+            ]
+
+            max_tournament_group = max(
+                max_tournament_group,
+                result["tournament_max_group_size"],
+            )
+
             accuracy = (
                 correct / completed
             )
@@ -660,6 +705,20 @@ async def evaluate(
 
     avg_rank_calls = (
         total_rank_calls
+        / completed
+        if completed > 0
+        else 0.0
+    )
+
+    avg_tournament_rounds = (
+        total_tournament_rounds
+        / completed
+        if completed > 0
+        else 0.0
+    )
+
+    avg_tournament_calls = (
+        total_tournament_calls
         / completed
         if completed > 0
         else 0.0
@@ -761,6 +820,21 @@ async def evaluate(
         f"{rank_disagreement_ratio:.4f}"
     )
 
+    print(
+        f"Average Tournament Rounds: "
+        f"{avg_tournament_rounds:.4f}"
+    )
+
+    print(
+        f"Average Tournament Rank Calls: "
+        f"{avg_tournament_calls:.4f}"
+    )
+
+    print(
+        f"Max Tournament Group Size: "
+        f"{max_tournament_group}"
+    )
+
     print("\n=========================================\n")
 
     return results
@@ -798,6 +872,8 @@ if __name__ == "__main__":
             "majority",
             "rank_no_reasoning",
             "rank_with_reasoning",
+            "tournament_no_reasoning",
+            "tournament_with_reasoning",
         ],
         default="majority",
     )

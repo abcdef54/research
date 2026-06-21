@@ -36,7 +36,7 @@ EXPERIMENT 2 (Can Ranking Beat Majority Vote?) — ADDED, fully config-flag gate
     - "rank_no_reasoning"   (Exp 2A)  -> `rank_select` node = ONE plain-text ranking call -> Top-1
     - "rank_with_reasoning" (Exp 2B)  -> `rank_select` node = ONE structured {reasoning, winner} call -> Top-1
 
-  Graph:  setup -> generate -> [route_selector by rank_mode] -> (finalize | rank_select) -> END
+  Graph:  setup -> generate -> [route_selector by rank_mode] -> (finalize | rank_select | tournament_select) -> END
   The ranker makes EXACTLY ONE LLM call (0 at width=1). There is ONE generation round, NO later
   rounds, NO tournament, NO verifier, NO critic, NO refinement, NO sparse children — the selector
   is isolated. In 2B "reasoning" means STRUCTURED OUTPUT only (a `reasoning` field, emitted FIRST),
@@ -48,6 +48,21 @@ EXPERIMENT 2 (Can Ranking Beat Majority Vote?) — ADDED, fully config-flag gate
   NB: the PARKED tournament `rank`/`_rank_group`/`select` below are the OLD iterative-search ranker
   and remain unused. Experiment 2's one-shot ranker (`rank_no_reasoning` / `rank_with_reasoning` +
   the `rank_select` node) is SEPARATE and is the only ranking code that runs.
+
+EXPERIMENT 3A (Can Tournament Ranking Beat One-Shot Ranking?) — ADDED, fully config-flag gated.
+  MOTIVATION: Experiment 2 found one-shot N-way ranking works at Width=3 but DEGRADES at Width=5 —
+  the ranker saturates when asked to compare too many candidates in a single call. Experiment 3A
+  keeps the SAME generator and the SAME one-shot rankers and changes ONLY how they are CALLED:
+  instead of ranking all N candidates at once, it runs a HIERARCHICAL TOURNAMENT where every ranking
+  call compares at most MAX_RANK_GROUP (=3) candidates. Pure orchestration — no new prompt, no
+  regeneration, no verifier/critic, no abstention, no extra generation round. Driven by `rank_mode`:
+    - "tournament_no_reasoning"   -> `tournament_select` node, per-group rank_no_reasoning  (3A-no)
+    - "tournament_with_reasoning" -> `tournament_select` node, per-group rank_with_reasoning (3A-rsn)
+  Tournament uses EVEN benchmark widths for balanced brackets (TOURNAMENT_MODE_CONFIG): low=1,
+  medium=4, high=6, extra=8, max=10. Adds tournament_rounds / tournament_rank_calls /
+  tournament_max_group_size; every Experiment 1/2 metric is preserved. The Experiment 1 (majority,
+  `finalize`) and Experiment 2 (one-shot, `rank_select`) paths are UNCHANGED — tournament is an
+  ADDITIONAL selector, not a replacement.
 
 PARKED FOR LATER ABLATIONS (kept in the file, but NOT wired into the graph and NOT called):
   the full search-round generator (`_generate_search_round`), `rank` / `_rank_group`, `select`,
@@ -92,6 +107,11 @@ SYSTEM_PROMPT_PATH = os.getenv(
 
 # Max candidates compared in a single ranking call (PARKED rank node only; unused in Experiment 1).
 RANK_GROUP = 4
+
+# Experiment 3A: a single tournament ranking call may compare AT MOST this many candidates. Exp 2
+# found one-shot ranking degrades as candidate count grows, so the bracket caps every call at 2–3
+# candidates. Distinct from the PARKED RANK_GROUP above (that one is for the old iterative ranker).
+MAX_RANK_GROUP = 3
 
 
 # ───────────────────────── LLM access ─────────────────────────
@@ -360,6 +380,12 @@ class AgentState(TypedDict):
     rank_parse_failed: bool                 # ranker reply couldn't be parsed to a label (fallback used); robustness
     rank_agreed_with_majority: bool         # ranker's final answer == the (no-LLM) majority winner's; divergence
 
+    # selector (Experiment 3A — hierarchical tournament). Populated ONLY by `tournament_select`;
+    # absent (read as 0 by the eval) for majority / one-shot runs, so those paths stay unchanged.
+    tournament_rounds: int                  # bracket rounds executed (0 if no ranking call, e.g. width=1)
+    tournament_rank_calls: int              # ranking LLM calls made across the tournament (== rank_calls)
+    tournament_max_group_size: int          # largest candidate group submitted to a single ranking call
+
 
 # ───────────── Structured output schemas (PARKED — unused in Experiment 1) ─────────────
 
@@ -403,6 +429,17 @@ MODE_CONFIG = {
     "max":    {"max_width": 9, "max_iterations": 0, "max_budget": 9},   # Experiment 2 benchmark width only
 }
 
+# Experiment 3A: tournament ranking uses EVEN widths so brackets split into balanced groups of 2–3
+# (e.g. 4->[2,2], 6->[3,3], 8->[2,2,2,2], 10->[3,3,2,2]). Selected by `setup` ONLY when rank_mode is
+# a tournament mode; the standard MODE_CONFIG above is untouched so Experiment 1/2 widths are unchanged.
+TOURNAMENT_MODE_CONFIG = {
+    "low":    {"max_width": 1,  "max_iterations": 0, "max_budget": 1},   # width 1 -> 0 ranking calls
+    "medium": {"max_width": 4,  "max_iterations": 0, "max_budget": 4},
+    "high":   {"max_width": 6,  "max_iterations": 0, "max_budget": 6},
+    "extra":  {"max_width": 8,  "max_iterations": 0, "max_budget": 8},
+    "max":    {"max_width": 10, "max_iterations": 0, "max_budget": 10},
+}
+
 # Internal estimate (PARKED governor; only consulted when bypass_governor=False — eval uses True).
 STEP_CONFIG = {
     "single": {"width": 1, "iterations": 0, "budget": 1},
@@ -412,10 +449,12 @@ STEP_CONFIG = {
 }
 
 
-def get_config(mode: str, steps: str, bypass_governor: bool = False) -> Dict:
+def get_config(mode: str, steps: str, bypass_governor: bool = False, tournament: bool = False) -> Dict:
     """mode = effort ceiling, reasoning_steps = effort needed; run with min(ceiling, needed).
-    With bypass_governor (eval), the mode ceiling drives compute directly so modes compare uniformly."""
-    ceil = MODE_CONFIG[mode]
+    With bypass_governor (eval), the mode ceiling drives compute directly so modes compare uniformly.
+    tournament=True selects TOURNAMENT_MODE_CONFIG (Experiment 3A even widths) instead of MODE_CONFIG;
+    the two tables share the same mode keys, so every other code path is unaffected."""
+    ceil = (TOURNAMENT_MODE_CONFIG if tournament else MODE_CONFIG)[mode]
     if bypass_governor:
         return {"max_iterations": ceil["max_iterations"], "width": ceil["max_width"], "budget": ceil["max_budget"]}
     need = STEP_CONFIG[steps]
@@ -436,7 +475,11 @@ def setup(state: AgentState, config: RunnableConfig) -> dict:
     mode = cfg["reasoning_mode"]
     bypass = cfg.get("bypass_governor", False)
     steps = cfg.get("reasoning_steps", "deep")  # only used when bypass=False
-    loop_cfg = get_config(mode, steps, bypass)
+    # Experiment 3A: tournament modes use the EVEN-width table (balanced brackets); all other modes
+    # (majority / one-shot) keep the standard MODE_CONFIG widths, so their behavior is unchanged.
+    rank_mode = cfg.get("rank_mode", "majority")
+    is_tournament = rank_mode in ("tournament_no_reasoning", "tournament_with_reasoning")
+    loop_cfg = get_config(mode, steps, bypass, tournament=is_tournament)
 
     return {
         "user_query": state["messages"][-1].content,
@@ -448,8 +491,8 @@ def setup(state: AgentState, config: RunnableConfig) -> dict:
         "iteration": 0,
         "pool": [],
         "best": None,
-        # Experiment 2 selector flag (default "majority" => Experiment-1 path is unchanged).
-        "rank_mode": cfg.get("rank_mode", "majority"),
+        # Experiment 2/3A selector flag (default "majority" => Experiment-1 path is unchanged).
+        "rank_mode": rank_mode,
     }
 
 
@@ -852,12 +895,270 @@ async def rank_select(state: AgentState, config: RunnableConfig) -> dict:
     }
 
 
-def route_selector(state: AgentState) -> Literal["finalize", "rank_select"]:
-    """Selector router (Experiment 2). Config flag `rank_mode` (resolved into state by `setup`)
-    chooses the selector: the two ranking sub-modes go to `rank_select`; everything else (default
-    "majority") keeps the original `finalize` majority-vote node, so Experiment 1 stays runnable."""
+# ───────────────────── Experiment 3A selector (ACTIVE — hierarchical tournament) ─────────────────────
+# Pure ORCHESTRATION over the Experiment 2 one-shot rankers (rank_no_reasoning / rank_with_reasoning):
+# NO new prompt, NO regeneration, NO verifier/critic, NO abstention, NO extra generation round — the
+# generator above is untouched and ONLY the selector changes. Motivated by Exp 2's finding that
+# one-shot N-way ranking degrades as candidate count grows: instead of one N-way call, run a balanced
+# tournament where every ranking call compares at most MAX_RANK_GROUP (=3) candidates.
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of two >= n (>= 1). Choosing a power-of-2 group count makes every later round
+    halve cleanly into a balanced binary bracket (winners stay a power of 2 after round 1)."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _split_balanced(items: list, num_groups: int) -> list[list]:
+    """Split `items` into `num_groups` contiguous groups whose sizes differ by at most 1 (larger
+    groups first). E.g. 10 into 4 -> [3,3,2,2], 8 into 4 -> [2,2,2,2]. Empty groups are dropped
+    (only possible if num_groups > len(items), which the caller avoids)."""
+    n = len(items)
+    base, rem = divmod(n, num_groups)
+    groups, start = [], 0
+    for g in range(num_groups):
+        size = base + (1 if g < rem else 0)
+        groups.append(items[start:start + size])
+        start += size
+    return [g for g in groups if g]
+
+
+def _tournament_groups(candidates: list["Candidate"]) -> list[list["Candidate"]]:
+    """One round's bracket split. If everything already fits in a single call (<= MAX_RANK_GROUP),
+    return one group. Otherwise pick the SMALLEST power-of-2 group count G whose largest group is
+    still <= MAX_RANK_GROUP, then split as evenly as possible. This reproduces the plan's brackets
+    exactly: 4 -> [2,2], 6 -> [3,3], 8 -> [2,2,2,2], 10 -> [3,3,2,2]; and degrades gracefully for
+    odd/other counts (a leftover singleton just takes a bye)."""
+    n = len(candidates)
+    if n <= MAX_RANK_GROUP:
+        return [list(candidates)]
+    min_groups = (n + MAX_RANK_GROUP - 1) // MAX_RANK_GROUP   # ceil(n / MAX_RANK_GROUP)
+    num_groups = _next_pow2(min_groups)
+    return _split_balanced(list(candidates), num_groups)
+
+
+async def tournament_rank(
+    user_query: str,
+    candidates: list["Candidate"],
+    rank_mode: str,
+    llm,
+    idx: str = "?",
+) -> "tuple[Candidate, Optional[str], int, bool, int, int]":
+    """Experiment 3A. Hierarchical tournament selector — an ORCHESTRATION layer over the existing
+    one-shot rankers; it does NOT introduce a new ranking prompt. Each ranking call sees at most
+    MAX_RANK_GROUP candidates, decomposing the N-way comparison that Exp 2 found degrades at larger N.
+    Algorithm: shuffle once -> split into a balanced bracket (`_tournament_groups`) -> rank each group
+    with the chosen one-shot ranker -> advance winners -> recurse until one candidate remains.
+
+    rank_mode: "tournament_with_reasoning" -> per-group rank_with_reasoning (structured {reasoning,
+    winner}); anything else -> per-group rank_no_reasoning (plain-text single letter).
+
+    RETURNS: (global_winner, winner_reasoning, total_rank_calls, parse_failed, tournament_rounds,
+              tournament_max_group_size).
+      - winner_reasoning: the DECIDING (final-round) call's reasoning for the with-reasoning mode,
+        else None. It is the justification for the global winner's last match.
+      - total_rank_calls: real LLM ranking calls only (groups of >= 2); a bye (size 1) costs nothing.
+      - parse_failed: True if ANY group call failed to parse a label (a fallback candidate was used).
+      - tournament_max_group_size: the largest group actually submitted to a ranking call (0 if none).
+    Independent of majority voting; needs no answer-equality key, so it carries over to non-numeric
+    tasks exactly like the one-shot ranker it wraps."""
+    group_ranker = rank_with_reasoning if rank_mode == "tournament_with_reasoning" else rank_no_reasoning
+
+    survivors = list(candidates)
+
+    # Global display labels (A, B, C, …) are pinned to the INPUT order — the same order the
+    # tournament_select node prints under "Candidates:" — so the bracket log is reconcilable with
+    # that listing and with the winner id printed downstream. Assigned BEFORE the shuffle on purpose:
+    # the shuffle only randomizes bracket SEEDING (who meets whom), never a candidate's identity
+    # label. LOG-ONLY, and independent of the local A/B/C labels each one-shot ranking call assigns
+    # internally to its own 2–3 group members. (Pinning to the shuffled order instead made the log
+    # impossible to reconcile with the pool listing — a candidate listed first could print as "B".)
+    labels = {c.id: lbl for c, lbl in zip(candidates, _candidate_labels(len(candidates)))}
+
+    def lbl(c: "Candidate") -> str:
+        return labels.get(c.id, "?")
+
+    random.shuffle(survivors)   # randomize bracket seeding only; identity labels already fixed above
+
+    print(f"\n[IDX {idx}] ================ Tournament Ranking ================\n")
+
+    total_calls = 0
+    rounds = 0
+    max_group_size = 0
+    parse_failed_any = False
+    # Reasoning that advanced each surviving candidate in its most recent match (id -> reasoning).
+    # The global winner's entry is the deciding final-round reasoning.
+    advance_reasoning: "dict[str, Optional[str]]" = {}
+
+    while len(survivors) > 1:
+        rounds += 1
+        groups = _tournament_groups(survivors)
+        print(f"[IDX {idx}] Round {rounds}")
+        next_survivors: list[Candidate] = []
+        for gi, group in enumerate(groups, start=1):
+            if len(group) == 1:
+                # Bye: a lone candidate advances with no ranking call (only happens off the even
+                # benchmark widths; 4/6/8/10 never produce a bye).
+                print(f"[IDX {idx}] Group {gi}: {lbl(group[0])} (bye)")
+                print(f"[IDX {idx}] Winner: {lbl(group[0])}\n")
+                next_survivors.append(group[0])
+                continue
+
+            max_group_size = max(max_group_size, len(group))
+            print(f"[IDX {idx}] Group {gi}:")
+            if len(group) == 2:
+                print(f"[IDX {idx}] {lbl(group[0])} vs {lbl(group[1])}")
+            else:                                   # 3-way (MAX_RANK_GROUP); list vertically
+                for c in group:
+                    print(f"[IDX {idx}] {lbl(c)}")
+
+            winner, reasoning, calls, parse_failed = await group_ranker(user_query, group, llm, idx)
+            total_calls += calls
+            parse_failed_any = parse_failed_any or parse_failed
+            advance_reasoning[winner.id] = reasoning
+            print(f"[IDX {idx}] Winner: {lbl(winner)}\n")
+            next_survivors.append(winner)
+        survivors = next_survivors
+
+    global_winner = survivors[0]
+    winner_reasoning = advance_reasoning.get(global_winner.id)
+
+    print(f"[IDX {idx}] Global Winner: {lbl(global_winner)} (id={global_winner.id[:8]})\n")
+    print(f"[IDX {idx}] Tournament Rounds: {rounds}")
+    print(f"[IDX {idx}] Tournament Rank Calls: {total_calls}")
+    print(f"[IDX {idx}] Tournament Max Group Size: {max_group_size}")
+    print(f"[IDX {idx}] ====================================================\n")
+
+    return global_winner, winner_reasoning, total_calls, parse_failed_any, rounds, max_group_size
+
+
+async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
+    """Experiment 3A selector node. Generation already produced `pool`; here we select Top-1 via a
+    HIERARCHICAL TOURNAMENT (`tournament_rank`) instead of one N-way ranking call — the response to
+    Exp 2's finding that one-shot ranking degrades as candidate count grows. Pure orchestration over
+    the one-shot rankers; the generator is untouched. Sub-mode from config `rank_mode`:
+      - "tournament_with_reasoning" -> per-group rank_with_reasoning (structured {reasoning, winner})
+      - "tournament_no_reasoning"   -> per-group rank_no_reasoning (plain-text single letter)
+    Width=1 short-circuits (one candidate, no call, 0 rounds). Preserves EVERY Experiment 1/2 metric
+    and adds tournament_rounds / tournament_rank_calls / tournament_max_group_size. `rank_calls`
+    equals `tournament_rank_calls` (both count the tournament's ranking LLM calls), so the existing
+    eval aggregation keeps working unchanged.
+    RETURNS: final_answer, messages, the self-consistency metrics, the selector-log fields, and the
+    three tournament metrics."""
+    cfg = config["configurable"]
+    rank_mode = state.get("rank_mode") or cfg.get("rank_mode", "tournament_no_reasoning")
+    pool = state.get("pool", [])
+    user_query = state.get("user_query", "")
+    idx = _sample_idx(state, config)
+
+    print(f"\n[IDX {idx}] ============ Tournament-Select Node (Experiment 3A) ============\n")
+    print(f"[IDX {idx}] Rank mode: {rank_mode}")
+    print(f"[IDX {idx}] Candidates: {len(pool)}")
+    for label, candidate in zip(_candidate_labels(len(pool)), pool):
+        print(f"[IDX {idx}] {label}: id={candidate.id[:8]} final={_extract_final_number(candidate.answer)}")
+
+    sampled_answers, sampled_numbers, vote_distribution, unique_answers = _self_consistency_metrics(pool)
+
+    if not pool:
+        print(f"[IDX {idx}] Empty pool.")
+        print(f"\n[IDX {idx}] ================================================================\n")
+        return {
+            "final_answer": "",
+            "messages": [AIMessage(content="")],
+            "sampled_answers": [],
+            "sampled_numbers": [],
+            "vote_distribution": {},
+            "unique_answers": 0,
+            "rank_mode": rank_mode,
+            "rank_latency": 0.0,
+            "rank_calls": 0,
+            "winner_candidate_id": None,
+            "rank_reasoning": None,
+            "rank_parse_failed": False,
+            "rank_agreed_with_majority": True,
+            "tournament_rounds": 0,
+            "tournament_rank_calls": 0,
+            "tournament_max_group_size": 0,
+        }
+
+    rank_latency = 0.0
+    rank_calls = 0
+    rank_reasoning: Optional[str] = None
+    rank_parse_failed = False
+    tournament_rounds = 0
+    tournament_max_group_size = 0
+
+    if len(pool) <= 1:
+        # Single candidate: nothing to select (no LLM call, no bracket).
+        winner = pool[0]
+        print(f"[IDX {idx}] Single candidate; no tournament needed.")
+    else:
+        rank_temp = cfg.get("rank_temperature", 0.0)   # greedy ranker by default -> reproducible
+        llm = get_llm(config, temperature=rank_temp)
+        t0 = time.perf_counter()
+        (winner, rank_reasoning, rank_calls, rank_parse_failed,
+         tournament_rounds, tournament_max_group_size) = await tournament_rank(
+            user_query, pool, rank_mode, llm, idx
+        )
+        rank_latency = time.perf_counter() - t0
+
+    # Agreement with majority vote, computed deterministically (NO extra LLM call), same as rank_select.
+    majority_winner = _majority_winner(pool)
+    rank_agreed_with_majority = (
+        majority_winner is not None
+        and same_answer(
+            _extract_final_number(majority_winner.answer),
+            _extract_final_number(winner.answer),
+        )
+    )
+
+    # Persist the deciding reasoning ON the selected candidate (with-reasoning mode); copy, don't mutate.
+    winner = winner.model_copy(update={"rank_reasoning": rank_reasoning})
+    answer = winner.answer
+
+    print(f"[IDX {idx}] Winner: id={winner.id[:8]} final={_extract_final_number(answer)}")
+    if rank_reasoning:
+        preview = rank_reasoning.strip().replace("\n", " ")
+        print(f"[IDX {idx}] Rank reasoning: {preview[:160]}{'…' if len(preview) > 160 else ''}")
+    print(f"[IDX {idx}] Tournament rounds: {tournament_rounds} | rank calls: {rank_calls} | max group: {tournament_max_group_size}")
+    print(f"[IDX {idx}] Rank latency: {rank_latency:.3f}s")
+    print(f"[IDX {idx}] Parse failed: {rank_parse_failed} | Agreed with majority: {rank_agreed_with_majority}")
+    print(f"\n[IDX {idx}] ================================================================\n")
+
+    return {
+        "final_answer": answer,
+        "messages": [AIMessage(content=answer)],
+        "sampled_answers": sampled_answers,
+        "sampled_numbers": sampled_numbers,
+        "vote_distribution": vote_distribution,
+        "unique_answers": unique_answers,
+        "rank_mode": rank_mode,
+        "rank_latency": rank_latency,
+        "rank_calls": rank_calls,                       # == tournament_rank_calls
+        "winner_candidate_id": winner.id,
+        "rank_reasoning": rank_reasoning,
+        "rank_parse_failed": rank_parse_failed,
+        "rank_agreed_with_majority": rank_agreed_with_majority,
+        "tournament_rounds": tournament_rounds,
+        "tournament_rank_calls": rank_calls,
+        "tournament_max_group_size": tournament_max_group_size,
+    }
+
+
+def route_selector(state: AgentState) -> Literal["finalize", "rank_select", "tournament_select"]:
+    """Selector router. Config flag `rank_mode` (resolved into state by `setup`) chooses the selector:
+      - "tournament_no_reasoning" / "tournament_with_reasoning" -> `tournament_select` (Exp 3A bracket)
+      - "rank_no_reasoning"       / "rank_with_reasoning"       -> `rank_select`       (Exp 2 one-shot)
+      - anything else (default "majority")                      -> `finalize`          (Exp 1 majority)
+    Existing modes are unchanged: only the two new tournament modes route to the new node."""
     mode = state.get("rank_mode", "majority")
-    return "rank_select" if mode in ("rank_no_reasoning", "rank_with_reasoning") else "finalize"
+    if mode in ("tournament_no_reasoning", "tournament_with_reasoning"):
+        return "tournament_select"
+    if mode in ("rank_no_reasoning", "rank_with_reasoning"):
+        return "rank_select"
+    return "finalize"
 
 
 # ───────────────────────── PARKED nodes / helpers (NOT wired into the graph) ─────────────────────────
@@ -1013,18 +1314,21 @@ builder.add_node("setup", setup)
 builder.add_node("generate", generate)
 builder.add_node("finalize", finalize)          # Experiment 1 selector: majority vote (default path)
 builder.add_node("rank_select", rank_select)    # Experiment 2 selector: one-shot ranking (2A / 2B)
+builder.add_node("tournament_select", tournament_select)  # Experiment 3A selector: hierarchical tournament
 
 builder.add_edge(START, "setup")
 builder.add_edge("setup", "generate")
 # Config-flag bypass: `rank_mode` selects the selector. Default ("majority") preserves the
-# Experiment-1 path generate -> finalize exactly; the ranking sub-modes divert to rank_select.
+# Experiment-1 path generate -> finalize exactly; one-shot ranking diverts to rank_select; tournament
+# ranking (Exp 3A) diverts to tournament_select. The first two selectors are unchanged.
 builder.add_conditional_edges(
     "generate",
     route_selector,
-    {"finalize": "finalize", "rank_select": "rank_select"},
+    {"finalize": "finalize", "rank_select": "rank_select", "tournament_select": "tournament_select"},
 )
 builder.add_edge("finalize", END)
 builder.add_edge("rank_select", END)
+builder.add_edge("tournament_select", END)
 
 GRAPH_RANKER = builder.compile()
 
@@ -1057,6 +1361,9 @@ def _fresh_state(question: str) -> AgentState:
         "rank_reasoning": None,
         "rank_parse_failed": False,
         "rank_agreed_with_majority": True,
+        "tournament_rounds": 0,
+        "tournament_rank_calls": 0,
+        "tournament_max_group_size": 0,
     }
 
 
@@ -1072,6 +1379,9 @@ if __name__ == "__main__":
             # Experiment 2 (selector). Default "majority" = Experiment 1. To run ranking instead:
             #   "rank_mode": "rank_no_reasoning",   # 2A: one plain-text ranking call
             #   "rank_mode": "rank_with_reasoning", # 2B: one structured {reasoning, winner} call
+            # Experiment 3A (hierarchical tournament; uses EVEN widths 1/4/6/8/10):
+            #   "rank_mode": "tournament_no_reasoning",   # 3A: per-group rank_no_reasoning
+            #   "rank_mode": "tournament_with_reasoning", # 3A: per-group rank_with_reasoning
             #   "rank_temperature": 0.0,            # ranker decoding temp (greedy by default)
             "rank_mode": "majority",
         }
