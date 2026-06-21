@@ -1,326 +1,248 @@
-# Experiment 2
+# Experiment 3B - Maximum Group Size = 3 Tournament Ranking
 
-# Can Ranking Beat Majority Vote?
+## Motivation
 
-## Background and Findings
+The previous Experiment 3A used a maximum tournament group size of 2:
 
-### Baseline Results (Qwen2.5-3B-Instruct Q4)
+* Medium (N=4): 2-2 → 3 ranking calls
+* High (N=6): 3-3 → 3 ranking calls
+* Extra (N=8): 2-2-2-2 → 7 ranking calls
 
-Low (Width=1)
-Final Accuracy: 84.69%
-Pass@N: 84.69%
-Selection Gap: 0%
+Results showed severe selector degradation as ranking depth increased:
 
-Medium (Width=3)
-Final Accuracy: 85.75%
-Pass@N: 92.19%
-Selection Gap: 6.44%
-Majority Failures: 85 questions
+### Extra Mode (2-2-2-2)
 
-High (Width=5)
-Final Accuracy: 87.04%
-Pass@N: 93.93%
-Selection Gap: 6.90%
-Majority Failures: 91 questions
+* Final Accuracy: 84.84%
+* Oracle Accuracy: 95.30%
+* Selection Gap: 10.46%
+* Average Rank Calls: 6.96
+* Average Rank Latency: 73.68s
 
-These results indicate:
-
-1. The generator is strong.
-2. Correct answers frequently exist among generated samples.
-3. Majority voting is the bottleneck.
-
-Approximately 6-7% of GSM8K questions already contain a correct answer somewhere in the generated samples, but majority voting still selects an incorrect answer.
-
-Therefore the next experiment should isolate the selection mechanism.
+This strongly suggests that the bottleneck is no longer the generator but the ranker itself. Oracle performance continues to increase with larger candidate pools, meaning the correct answer is usually present somewhere in the generated candidates. However, repeated ranking decisions introduce compounding errors that prevent the selector from choosing the correct answer.
 
 ---
 
-# Research Question
+## New Hypothesis
 
-Can LLM ranking outperform majority voting?
+The ranker may have a "sweet spot" at **3 candidates per comparison**.
 
----
+Evidence:
 
-# Experimental Principle
+### One-Shot Ranking (N=3)
 
-ONLY the selector changes.
+Medium reasoning mode:
 
-Everything else remains identical.
+* Accuracy: 85.90%
+* Selection Gap: 5.99%
+* Stable performance
+* Outperformed the raw baseline
+* Nearly matched majority voting
 
-Generator:
+This indicates that Qwen-3B can effectively compare **3 candidates simultaneously**.
 
-* No system prompt
-* No identity prompts
-* Human messages only
-* Plain text outputs
-* No structured outputs
-* Same temperature settings as Self-Consistency experiments.
+In contrast:
 
-No refinement.
-No verifier.
-No critic.
-No sparse children generation.
+### Tournament Medium (2-2)
 
-Pipeline:
+Accuracy collapsed:
 
-Generate N
-↓
-One-shot Ranking
-↓
-Return Top-1
+* Stupid: 81.27%
+* Smart: 84.31%
 
-There is only ONE generation round.
-
-There are NO later rounds.
-
-There is NO tournament ranking in this experiment.
-
-Tournament ranking belongs to the future iterative sparse-refinement architecture.
-
-This experiment uses:
-
-Generate N
-↓
-Rank all candidates in ONE call
-↓
-Select winner
-
-because the purpose is to isolate whether ranking itself can beat majority vote.
+This suggests that reducing comparisons to only 2 candidates at a time may not actually help. Instead, increasing ranking depth and accumulating selector errors appears to dominate any cognitive benefit.
 
 ---
 
-# Add Higher Benchmarking Modes
+## Experiment 3B Objective
 
-Current:
+Reduce tournament depth by increasing the maximum group size from:
 
-low
-width=1
+```python
+MAX_RANK_GROUP = 2
+```
 
-medium
-width=3
+to:
 
-high
-width=5
+```python
+MAX_RANK_GROUP = 3
+```
 
-Add:
+The goal is to:
 
-extra
-width=7
-
-max
-width=9
-
-These modes exist only for benchmarking and paper evaluation.
-
-No architectural changes.
-
-No refinement.
-
-No extra nodes.
-
-Only wider generation.
-
-Expected benchmark:
-
-Width:
-1
-3
-5
-7
-9
-
-for:
-
-Accuracy
-Pass@N
-Selection Gap
-Latency
+1. Reduce total ranking calls.
+2. Reduce compounded ranker errors.
+3. Keep per-call cognitive load within a range already proven to work well (N=3).
 
 ---
 
-# Experiment 2A
+## New Tournament Structures
 
-# One-Shot Ranking WITHOUT Structured Reasoning
+### Medium Reasoning Mode
 
-Pipeline:
+Previous:
 
-Generate N
-↓
-Rank All
-↓
-Return Top-1
+```text
+Generate 4
+2-2
+3 rank calls
+```
 
-Ranking output should be plain text only.
+New:
 
-Example prompt:
+```text
+Generate 3
+One-shot ranking
+1 rank call
+```
 
-Question:
-...
+This effectively becomes Experiment 2's medium one-shot ranker.
 
-Candidate A:
-...
+Expected:
 
-Candidate B:
-...
-
-Candidate C:
-...
-
-Choose the single answer that is most likely correct.
-
-Respond ONLY with:
-
-A
-
-or
-
-B
-
-or
-
-C
-
-No explanation.
-
-No reasoning field.
-
-No structured output.
-
-No additional LLM calls.
-
-Implementation:
-
-rank_no_reasoning()
-
-This function should:
-
-* receive all candidates in one call
-* return only winner ids
-* parse plain text responses
-* be completely independent from majority voting.
+* Accuracy ≈ 85.9%
+* Selection gap ≈ 6%
 
 ---
 
-# Experiment 2B
+### High Reasoning Mode
 
-# One-Shot Ranking WITH Structured Reasoning
+Previous:
 
-Definition:
+```text
+Generate 6
+3-3
+3 rank calls
+```
 
-Reasoning here means STRUCTURED OUTPUT.
+New:
 
-Reasoning does NOT mean:
+```text
+Generate 5
+3-2
+2 rank calls
+```
 
-* hidden chain-of-thought
-* an additional critic node
-* an additional LLM call.
+Structure:
 
-The ranker still makes only ONE call.
+Round 1:
 
-The only difference is that the response schema now includes a reasoning field.
+```text
+[A B C]
+[D E]
+```
 
-Example:
+Round 2:
 
-{
-"reasoning":
-"Candidate B correctly computes the intermediate value while Candidate A makes an arithmetic error.",
-"winner":
-"B"
-}
+```text
+Winner(ABC)
+Winner(DE)
+```
 
-IMPORTANT:
+Expected benefits:
 
-Put the reasoning field FIRST.
-
-The schema order should be:
-
-reasoning
-winner
-
-NOT:
-
-winner
-reasoning
-
-because previous experiments suggest field ordering can influence generation quality.
-
-Implementation:
-
-rank_with_reasoning()
-
-Store:
-
-rank_reasoning
-
-inside the selected candidate.
+* 33% fewer rank calls
+* Lower selector error accumulation
+* Similar or improved accuracy
 
 ---
 
-# Metrics
+### Extra Reasoning Mode
 
-Keep all existing metrics.
+Previous:
 
-Additionally log:
+```text
+Generate 8
+2-2-2-2
+7 rank calls
+```
 
-rank_mode:
+New:
 
-* majority
-* rank_no_reasoning
-* rank_with_reasoning
+```text
+Generate 7
+3-3-1
+2 rank calls
+```
 
-rank_latency
+Structure:
 
-rank_calls
+Round 1:
 
-winner_candidate_id
+```text
+[A B C]
+[D E F]
+[G]
+```
 
-rank_reasoning
-(nullable for no-reasoning mode)
+Round 2:
 
----
+```text
+Winner(ABC)
+Winner(DEF)
+G
+```
 
-# Main Comparison Table
+If only one candidate remains in a group:
 
-Compare:
+* No ranking call is required.
+* The candidate automatically advances.
 
-Majority Vote
-vs
-Ranking Without Reasoning
-vs
-Ranking With Reasoning
+Expected benefits:
 
-under:
-
-Width:
-1
-3
-5
-7
-9
-
-Metrics:
-
-Final Accuracy
-Pass@N
-Selection Gap
-Majority Failures
-Latency
+* Rank calls reduced from ~7 to ~2
+* Massive reduction in compounded selector errors
+* Lower latency
+* Better selector utilization
 
 ---
 
-# Hypothesis
+## Architectural Principle
 
-Because:
+Maximum candidates evaluated per rank call:
 
-Pass@N:
-93.93%
+```text
+≤ 3
+```
 
-Accuracy:
-87.04%
+The selector should never compare:
 
-Selection Gap:
-6.90%
+* 4 candidates
+* 5 candidates
+* 7 candidates
+* 9 candidates
 
-the ranker has substantial room for improvement.
+because previous experiments indicate ranking quality deteriorates as candidate count increases.
 
-Even partial recovery of the selection gap would demonstrate that ranking is a stronger selector than majority voting and would justify proceeding to the future sparse-refinement architecture.
+---
+
+## Metrics to Track
+
+Continue logging:
+
+* Final Accuracy
+* Oracle Accuracy (Pass@N)
+* Selection Gap
+* Majority Failures
+* Average Unique Answers
+* Average Agreement Ratio
+* Average Vote Entropy
+* Average Vote Margin
+* Unanimous Ratio
+* Average Invalid Samples
+* Average Latency
+* Average Rank Calls
+* Average Rank Latency
+* Rank Parse Failures
+* Rank Parse Failure Ratio
+* Rank Disagreement Ratio
+* Average Tournament Rounds
+* Average Tournament Rank Calls
+* Max Tournament Group Size
+
+No new metrics are required.
+
+---
+
+## Research Question
+
+Does reducing tournament depth by increasing the maximum comparison group size from 2 to 3 improve selector performance by reducing compounded ranking errors while remaining within the ranker's effective cognitive capacity?

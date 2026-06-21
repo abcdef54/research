@@ -9,7 +9,7 @@ import time
 import math
 
 # from graph import GRAPH, AgentState
-from ranker import GRAPH_RANKER, AgentState
+from ranker2 import GRAPH_RANKER, AgentState
 
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
@@ -365,7 +365,7 @@ async def evaluate_sample(
             "winner_candidate_id": winner_candidate_id,
             "rank_reasoning": rank_reasoning,
 
-            # Tournament Metrics (Experiment 3A; 0 for non-tournament modes)
+            # Tournament Metrics (Experiment 3B; 0 for non-tournament modes)
             "tournament_rounds": tournament_rounds,
             "tournament_rank_calls": tournament_rank_calls,
             "tournament_max_group_size": tournament_max_group_size,
